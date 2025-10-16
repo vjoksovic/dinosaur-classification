@@ -10,6 +10,7 @@ from tqdm import tqdm
 from utils.utils import load_config, set_seed
 from dataset.dataset_split import load_dataset_split
 from model.model import DinoNet
+from torchvision import models, transforms
 
 
 config = load_config("src/config/config.py")
@@ -19,6 +20,7 @@ set_seed(config["reproducibility"]["seed"])
 os.makedirs(config["paths"]["model_dir"], exist_ok=True)
 os.makedirs(config["paths"]["log_dir"], exist_ok=True)
 
+# Datasets
 train_ds, val_ds, _ = load_dataset_split()
 
 train_loader = DataLoader(
@@ -35,28 +37,64 @@ val_loader = DataLoader(
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Model
 model = DinoNet(
     num_classes=config["data"]["num_classes"],
-    dropout=config["model"]["dropout_rate"],
+    dropout=config["model"].get("dropout_rate", 0.5),
+    pretrained=bool(config["model"].get("pretrained", False)),
 ).to(device)
 
-criterion = nn.CrossEntropyLoss()
+# Optionally load pretrained weights if configured
+if str(config["model"].get("architecture", "")).lower() == "resnet34":
+    use_pretrained = bool(config["model"].get("pretrained", False))
+    if use_pretrained:
+        try:
+            # Rebuild model with pretrained weights
+            from model.model import DinoNet as _DinoNet
+            import importlib
+            importlib.reload(__import__('model.model', fromlist=['DinoNet']))
+        except Exception:
+            pass
 
-optimizer_name = config["training"].get("optimizer", "adam").lower()
-if optimizer_name == "adam":
-    optimizer = optim.Adam(
-        model.parameters(),
-        lr=config["training"]["learning_rate"],
-        weight_decay=config["training"].get("weight_decay", 0.0),
+ls = float(config["training"].get("label_smoothing", 0.0))
+criterion = nn.CrossEntropyLoss(label_smoothing=ls) if ls > 0 else nn.CrossEntropyLoss()
+
+optimizer_name = config["training"].get("optimizer", "sgd").lower()
+base_lr = float(config["training"].get("learning_rate", 1e-2))
+weight_decay = float(config["training"].get("weight_decay", 1e-4))
+
+# Parameter groups: lower LR for backbone, higher for classifier head
+backbone_lr_mult = float(config["training"].get("backbone_lr_multiplier", 0.1))
+if hasattr(model, "backbone") and hasattr(model.backbone, "fc"):
+    backbone_params = [p for n, p in model.backbone.named_parameters() if not n.startswith("fc.")]
+    head_params = list(model.backbone.fc.parameters())
+    param_groups = [
+        {"params": backbone_params, "lr": base_lr * backbone_lr_mult},
+        {"params": head_params, "lr": base_lr},
+    ]
+else:
+    param_groups = [{"params": model.parameters(), "lr": base_lr}]
+
+if optimizer_name == "sgd":
+    optimizer = optim.SGD(
+        param_groups,
+        momentum=float(config["training"].get("momentum", 0.9)),
+        nesterov=bool(config["training"].get("nesterov", True)),
+        weight_decay=weight_decay,
     )
 else:
-    optimizer = optim.Adam(
-        model.parameters(), lr=config["training"]["learning_rate"]
-    )
+    optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+
+# Optionally freeze backbone for warmup epochs
+freeze_epochs = int(config["training"].get("freeze_backbone_epochs", 0))
+if freeze_epochs > 0 and hasattr(model, "backbone"):
+    for n, p in model.backbone.named_parameters():
+        if not n.startswith("fc."):
+            p.requires_grad = False
 
 # Scheduler (configurable)
 sched_cfg = config.get("scheduler", {})
-sched_type = str(sched_cfg.get("type", "cosine")).lower()
+sched_type = str(sched_cfg.get("type", "onecycle")).lower()
 scheduler = None
 if sched_type == "cosine":
     scheduler = CosineAnnealingLR(optimizer, T_max=config["training"]["epochs"]) 
@@ -66,7 +104,7 @@ elif sched_type == "onecycle":
         optimizer,
         max_lr=oc.get("max_lr", config["training"]["learning_rate"]),
         epochs=config["training"]["epochs"],
-        steps_per_epoch=0,  # will set after DataLoader is created
+        steps_per_epoch=len(train_loader),
         pct_start=oc.get("pct_start", 0.3),
         div_factor=oc.get("div_factor", 25.0),
         final_div_factor=oc.get("final_div_factor", 1e4),
@@ -82,6 +120,18 @@ best_val_loss = float("inf")
 patience = 7
 epochs_no_improve = 0
 
+# Exponential Moving Average (EMA) of model params
+ema_cfg = config.get("training", {}).get("ema", {})
+ema_enabled = bool(ema_cfg.get("enabled", False))
+ema_decay = float(ema_cfg.get("decay", 1))
+ema_state = None
+
+def _get_model_state_dict(m):
+    return {k: v.detach().clone() for k, v in m.state_dict().items()}
+
+if ema_enabled:
+    ema_state = _get_model_state_dict(model)
+
 # CSV logger
 csv_path = os.path.join(config["paths"]["log_dir"], "training.csv")
 with open(csv_path, mode="w", newline="") as f:
@@ -94,20 +144,33 @@ for epoch in range(config["training"]["epochs"]):
     correct = 0
     total_samples = 0
 
-    # If OneCycleLR, ensure steps_per_epoch is set (first epoch only)
-    if isinstance(scheduler, OneCycleLR) and scheduler.total_steps == 0:
-        # Recreate OneCycleLR with correct steps_per_epoch
-        oc = sched_cfg.get("onecycle", {})
-        scheduler = OneCycleLR(
-            optimizer,
-            max_lr=oc.get("max_lr", config["training"]["learning_rate"]),
-            epochs=config["training"]["epochs"],
-            steps_per_epoch=len(train_loader),
-            pct_start=oc.get("pct_start", 0.3),
-            div_factor=oc.get("div_factor", 25.0),
-            final_div_factor=oc.get("final_div_factor", 1e4),
-            anneal_strategy="cos",
-        )
+    # Unfreeze backbone after warmup epochs and rebuild optimizer with param groups
+    if freeze_epochs > 0 and epoch == freeze_epochs:
+        if hasattr(model, "backbone"):
+            for n, p in model.backbone.named_parameters():
+                if not n.startswith("fc."):
+                    p.requires_grad = True
+            # Rebuild param groups with correct requires_grad flags
+            if hasattr(model, "backbone") and hasattr(model.backbone, "fc"):
+                backbone_params = [p for n, p in model.backbone.named_parameters() if (not n.startswith("fc.")) and p.requires_grad]
+                head_params = [p for p in model.backbone.fc.parameters() if p.requires_grad]
+                param_groups = [
+                    {"params": backbone_params, "lr": base_lr * backbone_lr_mult},
+                    {"params": head_params, "lr": base_lr},
+                ]
+            else:
+                param_groups = [{"params": [p for p in model.parameters() if p.requires_grad], "lr": base_lr}]
+            if optimizer_name == "sgd":
+                optimizer = optim.SGD(
+                    param_groups,
+                    momentum=float(config["training"].get("momentum", 0.9)),
+                    nesterov=bool(config["training"].get("nesterov", True)),
+                    weight_decay=weight_decay,
+                )
+            else:
+                optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+
+    # OneCycleLR already initialized with correct steps_per_epoch
 
     train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['training']['epochs']} [Train]", 
                       leave=False, unit="batch")
@@ -127,6 +190,13 @@ for epoch in range(config["training"]["epochs"]):
         if isinstance(scheduler, OneCycleLR):
             scheduler.step()
 
+        # EMA update per step (only for floating-point tensors)
+        if ema_enabled:
+            with torch.no_grad():
+                for k, v in model.state_dict().items():
+                    if k in ema_state and v.dtype.is_floating_point:
+                        ema_state[k].mul_(ema_decay).add_(v.detach(), alpha=1.0 - ema_decay)
+
         total_loss += loss.item() * images.size(0)
         correct += (outputs.argmax(1) == labels).sum().item()
         total_samples += labels.size(0)
@@ -144,6 +214,14 @@ for epoch in range(config["training"]["epochs"]):
 
     # Validation
     model.eval()
+    swapped_to_ema = False
+    if ema_enabled and ema_state is not None:
+        # Swap model params with EMA for evaluation
+        orig_state = _get_model_state_dict(model)
+        # Load only matching floating-point tensors
+        safe_ema = {k: v for k, v in ema_state.items() if k in orig_state and v.dtype.is_floating_point}
+        model.load_state_dict({**orig_state, **safe_ema}, strict=False)
+        swapped_to_ema = True
     val_total_loss = 0.0
     val_correct = 0
     val_total = 0
@@ -170,6 +248,10 @@ for epoch in range(config["training"]["epochs"]):
 
     val_loss = val_total_loss / val_total
     val_acc = val_correct / val_total
+
+    # Restore original weights after EMA eval
+    if swapped_to_ema:
+        model.load_state_dict(orig_state, strict=False)
 
     # Per-epoch scheduler step (Cosine)
     if isinstance(scheduler, CosineAnnealingLR):

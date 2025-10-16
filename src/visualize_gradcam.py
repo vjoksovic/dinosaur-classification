@@ -11,7 +11,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
-import cv2
 
 from dataset.dataset_split import load_dataset_split
 from model.model import DinoNet
@@ -47,13 +46,14 @@ def main():
         raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}. Train the model first.")
     
     model = DinoNet(num_classes=config["data"]["num_classes"], 
-                    dropout=config["model"]["dropout_rate"]).to(device)
+                    dropout=config["model"]["dropout_rate"],
+                    pretrained=bool(config["model"].get("pretrained", False))).to(device)
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
     model.eval()
     
     # Initialize Grad-CAM
-    # Target the last convolutional layer (before the final pooling)
-    target_layer = model.conv_layers[-4]  # The last Conv2d layer
+    # Target the last convolutional block in ResNet-34 backbone
+    target_layer = model.backbone.layer4[-1].conv2
     gradcam = GradCAM(model, target_layer)
     
     print(f"Target layer for Grad-CAM: {target_layer}")
@@ -65,46 +65,45 @@ def main():
     
     print(f"Generating Grad-CAM visualizations for {len(sample_indices)} samples...")
     
-    with torch.no_grad():
-        for i, idx in enumerate(sample_indices):
-            # Get the sample
-            image, label = test_ds[idx]
-            image_tensor = image.unsqueeze(0).to(device)  # Add batch dimension
-            
-            # Get prediction
-            output = model(image_tensor)
-            probs = F.softmax(output, dim=1)
-            confidence, pred_class = torch.max(probs, dim=1)
-            
-            pred_class = pred_class.item()
-            true_class = label
-            confidence = confidence.item()
-            
-            print(f"Sample {i+1}/{len(sample_indices)}: "
-                  f"True={class_names[true_class]}, "
-                  f"Pred={class_names[pred_class]}, "
-                  f"Conf={confidence:.3f}")
-            
-            # Generate Grad-CAM heatmap
-            heatmap = gradcam.generate_cam(image_tensor, pred_class)
-            
-            # Convert tensor to image for visualization
-            original_image = tensor_to_image(image)
-            
-            # Create overlay
-            overlay = gradcam.overlay_heatmap(original_image, heatmap)
-            
-            # Save visualization
-            save_path = os.path.join(gradcam_dir, f"gradcam_sample_{i+1:02d}.png")
-            save_gradcam_visualization(
-                original_image=original_image,
-                heatmap=heatmap,
-                overlay=overlay,
-                predicted_class=class_names[pred_class],
-                true_class=class_names[true_class],
-                confidence=confidence,
-                save_path=save_path
-            )
+    for i, idx in enumerate(sample_indices):
+        # Get the sample
+        image, label = test_ds[idx]
+        image_tensor = image.unsqueeze(0).to(device)  # Add batch dimension
+
+        # Get prediction
+        output = model(image_tensor)
+        probs = F.softmax(output, dim=1)
+        confidence, pred_class = torch.max(probs, dim=1)
+
+        pred_class = pred_class.item()
+        true_class = label
+        confidence = confidence.item()
+
+        print(f"Sample {i+1}/{len(sample_indices)}: "
+              f"True={class_names[true_class]}, "
+              f"Pred={class_names[pred_class]}, "
+              f"Conf={confidence:.3f}")
+
+        # Generate Grad-CAM heatmap (requires gradients)
+        heatmap = gradcam.generate_cam(image_tensor, pred_class)
+
+        # Convert tensor to image for visualization
+        original_image = tensor_to_image(image)
+
+        # Create overlay
+        overlay = gradcam.overlay_heatmap(original_image, heatmap)
+
+        # Save visualization
+        save_path = os.path.join(gradcam_dir, f"gradcam_sample_{i+1:02d}.png")
+        save_gradcam_visualization(
+            original_image=original_image,
+            heatmap=heatmap,
+            overlay=overlay,
+            predicted_class=class_names[pred_class],
+            true_class=class_names[true_class],
+            confidence=confidence,
+            save_path=save_path
+        )
     
     print(f"Grad-CAM visualizations saved to: {gradcam_dir}")
     

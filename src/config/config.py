@@ -10,19 +10,29 @@ CONFIG = {
     "num_classes": 15,
   },
   "model": {
-    "architecture": "custom_cnn",
+    "architecture": "resnet34",
     "dropout_rate": 0.5,
+    "pretrained": True
   },
   "training": {
     "epochs": 50,
-    "optimizer": "adam",
-    "learning_rate": 1e-3,
-    "weight_decay": 1e-2,
+    "optimizer": "sgd",
+    "learning_rate": 3e-2,
+    "weight_decay": 1e-4,
+    "momentum": 0.9,
+    "nesterov": True,
+    "label_smoothing": 0.1,
+    "backbone_lr_multiplier": 0.05,
+    "freeze_backbone_epochs": 2,
+    "ema": {
+      "enabled": True,
+      "decay": 0.999
+    }
   },
   "scheduler": {
-    "type": "cosine", 
+    "type": "onecycle", 
     "onecycle": {
-      "max_lr": 1e-3,
+      "max_lr": 3e-2,
       "pct_start": 0.3,
       "div_factor": 25.0,
       "final_div_factor": 1e4

@@ -7,9 +7,9 @@ to understand which parts of the input image the model focuses on when making pr
 
 import torch
 import torch.nn.functional as F
-import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from typing import Tuple, Optional
 import os
 
@@ -37,7 +37,8 @@ class GradCAM:
         
         # Register hooks
         self.target_layer.register_forward_hook(self.save_activation)
-        self.target_layer.register_backward_hook(self.save_gradient)
+        # Use full backward hook to avoid deprecation warnings
+        self.target_layer.register_full_backward_hook(self.save_gradient)
     
     def save_activation(self, module, input, output):
         """Save the activation from the target layer."""
@@ -58,8 +59,8 @@ class GradCAM:
         Returns:
             Grad-CAM heatmap as numpy array
         """
+        # Ensure gradients are enabled for CAM generation
         self.model.eval()
-        
         # Forward pass
         output = self.model(input_tensor)
         
@@ -67,7 +68,7 @@ class GradCAM:
             class_idx = output.argmax(dim=1).item()
         
         # Backward pass
-        self.model.zero_grad()
+        self.model.zero_grad(set_to_none=True)
         output[0, class_idx].backward(retain_graph=True)
         
         # Generate CAM
@@ -78,14 +79,15 @@ class GradCAM:
         weights = torch.mean(gradients, dim=(1, 2))
         
         # Weighted combination of activation maps
-        cam = torch.zeros(activations.shape[1:], dtype=torch.float32)
+        cam = torch.zeros(activations.shape[1:], dtype=activations.dtype, device=activations.device)
         for i, w in enumerate(weights):
-            cam += w * activations[i, :, :]
+            cam = cam + (w * activations[i, :, :])
         
         # Apply ReLU and normalize
         cam = F.relu(cam)
         cam = cam - cam.min()
-        cam = cam / cam.max()
+        max_val = cam.max().clamp(min=1e-8)
+        cam = cam / max_val
         
         return cam.detach().cpu().numpy()
     
@@ -102,15 +104,24 @@ class GradCAM:
         Returns:
             Image with heatmap overlay
         """
-        # Resize heatmap to match image size
-        heatmap_resized = cv2.resize(heatmap, (image.shape[1], image.shape[0]))
-        
-        # Convert heatmap to colormap
-        heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-        
-        # Overlay heatmap on image
-        overlay = cv2.addWeighted(image, 1 - alpha, heatmap_colored, alpha, 0)
-        
+        # Resize heatmap to match image size using torch bilinear interpolation
+        h, w = image.shape[0], image.shape[1]
+        heatmap_t = torch.from_numpy(heatmap).unsqueeze(0).unsqueeze(0).float()
+        heatmap_resized = torch.nn.functional.interpolate(
+            heatmap_t, size=(h, w), mode="bilinear", align_corners=False
+        ).squeeze().numpy()
+
+        # Convert heatmap to RGB using matplotlib colormap (values in [0,1])
+        heatmap_resized = np.clip(heatmap_resized, 0.0, 1.0)
+        heatmap_colored = cm.get_cmap("jet")(heatmap_resized)[..., :3]  # RGB in [0,1]
+        heatmap_colored = (heatmap_colored * 255).astype(np.uint8)
+
+        # Alpha blend
+        overlay = (
+            image.astype(np.float32) * (1.0 - alpha)
+            + heatmap_colored.astype(np.float32) * alpha
+        ).astype(np.uint8)
+
         return overlay
 
 
