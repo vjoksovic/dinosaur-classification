@@ -260,10 +260,10 @@ for epoch in range(config["training"]["epochs"]):
     # Save best by val_acc
     if val_acc > best_val_acc:
         best_val_acc = val_acc
-        torch.save(
-            model.state_dict(),
-            os.path.join(config["paths"]["model_dir"], "best_model.pth"),
-        )
+         if ema_enabled and ema_state is not None:
+            torch.save(ema_state, os.path.join(config["paths"]["model_dir"], "best_model.pth"))
+        else:
+            torch.save(model.state_dict(), os.path.join(config["paths"]["model_dir"], "best_model.pth"))
 
     # Early stopping by val_loss
     if val_loss < best_val_loss - 1e-6:
